@@ -1,9 +1,8 @@
 use burn::{
     data::dataloader::batcher::Batcher,
-    prelude::*,
-    tensor::{backend::Backend, Data, ElementConversion, Tensor},
+    tensor::{backend::Backend, Int, Tensor, TensorData, Shape},
 };
-use image::{io::Reader as ImageReader, DynamicImage, GenericImageView};
+use image::{DynamicImage, ImageReader};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -33,11 +32,9 @@ impl MalariaLabel {
         }
     }
 
-    pub fn to_tensor<B: Backend>(&self, device: &B::Device) -> Tensor<B, 1> {
-        Tensor::from_data(
-            Data::from([self.to_index().elem::<B::FloatElem>()]),
-            device,
-        )
+    pub fn to_tensor<B: Backend>(&self, device: &B::Device) -> Tensor<B, 1, Int> {
+        let data: Vec<i64> = vec![self.to_index() as i64];
+        Tensor::from_data(TensorData::new(data, Shape::new([1])), device)
     }
 }
 
@@ -64,8 +61,8 @@ impl<B: Backend> MalariaBatcher<B> {
     }
 }
 
-impl<B: Backend> Batcher<MalariaItem, MalariaBatch<B>> for MalariaBatcher<B> {
-    fn batch(&self, items: Vec<MalariaItem>) -> MalariaBatch<B> {
+impl<B: Backend> Batcher<B, MalariaItem, MalariaBatch<B>> for MalariaBatcher<B> {
+    fn batch(&self, items: Vec<MalariaItem>, device: &B::Device) -> MalariaBatch<B> {
         let batch_size = items.len();
         let height = 128;
         let width = 128;
@@ -74,14 +71,14 @@ impl<B: Backend> Batcher<MalariaItem, MalariaBatch<B>> for MalariaBatcher<B> {
         let mut labels = Vec::with_capacity(batch_size);
         
         for item in items {
-            // Resize image to fixed size
+            // Redimensionner l'image
             let img = item.image.resize_exact(
                 width as u32,
                 height as u32,
                 image::imageops::FilterType::Lanczos3,
             );
             
-            // Convert to RGB and normalize to [0, 1]
+            // Convertir en RGB et normaliser
             let rgb_img = img.to_rgb8();
             
             for c in 0..3 {
@@ -89,43 +86,42 @@ impl<B: Backend> Batcher<MalariaItem, MalariaBatch<B>> for MalariaBatcher<B> {
                     for x in 0..width {
                         let pixel = rgb_img.get_pixel(x as u32, y as u32);
                         let value = pixel[c] as f32 / 255.0;
-                        images.push(value.elem());
+                        images.push(value);
                     }
                 }
             }
             
-            labels.push(item.label.to_index().elem::<B::IntElem>());
+            labels.push(item.label.to_index() as i64);
         }
         
-        let images = Tensor::from_data(
-            Data::new(images, Shape::new([batch_size, 3, height, width])),
-            &self.device,
-        );
+        let images_data = TensorData::new(images, Shape::new([batch_size, 3, height, width]));
+        let images_tensor = Tensor::from_data(images_data, device);
         
-        let targets = Tensor::from_data(
-            Data::new(labels, Shape::new([batch_size])),
-            &self.device,
-        );
+        let targets_data = TensorData::new(labels, Shape::new([batch_size]));
+        let targets_tensor: Tensor<B, 1, Int> = Tensor::from_data(targets_data, device);
         
-        MalariaBatch { images, targets }
+        MalariaBatch { 
+            images: images_tensor, 
+            targets: targets_tensor 
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct MalariaBatch<B: Backend> {
     pub images: Tensor<B, 4>,
-    pub targets: Tensor<B, 1>,
+    pub targets: Tensor<B, 1, Int>,
 }
 
 pub struct MalariaDataset {
-    items: Vec<(PathBuf, MalariaLabel)>,
+    pub items: Vec<(PathBuf, MalariaLabel)>,
 }
 
 impl MalariaDataset {
     pub fn new(data_dir: &Path) -> anyhow::Result<Self> {
         let mut items = Vec::new();
         
-        // Load parasitized images
+        // Charger les images parasitées
         let parasitized_dir = data_dir.join("Parasitized");
         if parasitized_dir.exists() {
             for entry in std::fs::read_dir(parasitized_dir)? {
@@ -139,7 +135,7 @@ impl MalariaDataset {
             }
         }
         
-        // Load uninfected images
+        // Charger les images non infectées
         let uninfected_dir = data_dir.join("Uninfected");
         if uninfected_dir.exists() {
             for entry in std::fs::read_dir(uninfected_dir)? {
@@ -165,7 +161,7 @@ impl MalariaDataset {
     }
     
     pub fn split(&self, train_ratio: f64, val_ratio: f64) -> (Self, Self, Self) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut shuffled: Vec<_> = self.items.clone();
         shuffled.shuffle(&mut rng);
         
@@ -184,12 +180,6 @@ impl MalariaDataset {
         )
     }
     
-    pub fn iter(&self) -> impl Iterator<Item = anyhow::Result<MalariaItem>> + '_ {
-        self.items.iter().map(|(path, label)| {
-            MalariaItem::new(path.clone(), label.clone())
-        })
-    }
-    
     pub fn get_batch(&self, indices: &[usize]) -> Vec<MalariaItem> {
         indices
             .iter()
@@ -202,7 +192,7 @@ impl MalariaDataset {
 }
 
 pub struct MalariaDataLoader {
-    dataset: Arc<MalariaDataset>,
+    pub dataset: Arc<MalariaDataset>,
     batch_size: usize,
     shuffle: bool,
 }
@@ -226,6 +216,10 @@ impl MalariaDataLoader {
             shuffle: self.shuffle,
         }
     }
+    
+    pub fn len(&self) -> usize {
+        self.dataset.len()
+    }
 }
 
 pub struct MalariaDataLoaderIter {
@@ -245,7 +239,7 @@ impl Iterator for MalariaDataLoaderIter {
         }
         
         if self.shuffle && self.current == 0 {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             self.indices.shuffle(&mut rng);
         }
         

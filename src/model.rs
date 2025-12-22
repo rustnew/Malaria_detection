@@ -8,7 +8,7 @@ use burn::{
     tensor::backend::AutodiffBackend,
 };
 
-#[derive(Config)]
+#[derive(Config, Debug)]
 pub struct MalariaModelConfig {
     #[config(default = 0.5)]
     dropout: f64,
@@ -31,7 +31,6 @@ impl MalariaModelConfig {
                 .with_padding(burn::nn::PaddingConfig2d::Same)
                 .init(device),
             pool: AdaptiveAvgPool2dConfig::new([8, 8]).init(),
-            flatten: burn::nn::Flatten::new(),
             dropout: DropoutConfig::new(self.dropout).init(),
             fc1: LinearConfig::new(256 * 8 * 8, 512).init(device),
             fc2: LinearConfig::new(512, 256).init(device),
@@ -52,7 +51,6 @@ pub struct MalariaModel<B: Backend> {
     conv3: Conv2d<B>,
     conv4: Conv2d<B>,
     pool: AdaptiveAvgPool2d,
-    flatten: burn::nn::Flatten,
     dropout: Dropout,
     fc1: Linear<B>,
     fc2: Linear<B>,
@@ -78,8 +76,9 @@ impl<B: Backend> MalariaModel<B> {
         // Adaptive pooling
         let x = self.pool.forward(x);
         
-        // Flatten
-        let x = self.flatten.forward(x);
+        // Flatten manually
+        let [batch_size, channels, height, width] = x.dims();
+        let x = x.reshape([batch_size, channels * height * width]);
         
         // Fully connected layers with dropout
         let x = self.fc1.forward(x);
@@ -94,13 +93,13 @@ impl<B: Backend> MalariaModel<B> {
         self.fc3.forward(x)
     }
 
-    pub fn forward_classification(&self, x: Tensor<B, 4>) -> Tensor<B, 1> {
+    pub fn forward_classification(&self, x: Tensor<B, 4>) -> Tensor<B, 2> {
         let output = self.forward(x);
-        output.argmax(1)
+        output
     }
 }
 
-#[derive(Config)]
+#[derive(Config, Debug)]
 pub struct TrainingConfig {
     pub learning_rate: f64,
     pub num_epochs: usize,
