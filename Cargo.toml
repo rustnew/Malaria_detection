@@ -1,0 +1,28 @@
+[package]
+name = "Burn_model"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+burn = { version = "0.19.1", features = ["std", "tui", "train", "vision", "ndarray", "autodiff"], default-features = false }
+burn-ndarray = "0.19.1"
+burn-wgpu = "0.19.1"
+burn-train = "0.19.1"
+image = "0.25.9"
+rand = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures = "0.3"
+anyhow = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["full"] }
+parking_lot = "0.12"
+env_logger = "0.11"
+log = "0.4"
+tqdm = "0.8.0"
+
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
