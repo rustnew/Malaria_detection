@@ -1,0 +1,16 @@
+2026-01-03T11:52:31.750052Z  INFO burn_train::learner::train_val: Fitting the model:
+ MalariaModel {
+  conv1: Conv2d {ch_in: 3, ch_out: 32, stride: [1, 1], kernel_size: [3, 3], dilation: [1, 1], groups: 1, padding: Same, params: 896}
+  conv2: Conv2d {ch_in: 32, ch_out: 64, stride: [1, 1], kernel_size: [3, 3], dilation: [1, 1], groups: 1, padding: Same, params: 18496}
+  conv3: Conv2d {ch_in: 64, ch_out: 128, stride: [1, 1], kernel_size: [3, 3], dilation: [1, 1], groups: 1, padding: Same, params: 73856}
+  conv4: Conv2d {ch_in: 128, ch_out: 256, stride: [1, 1], kernel_size: [3, 3], dilation: [1, 1], groups: 1, padding: Same, params: 295168}
+  pool: AdaptiveAvgPool2d {output_size: [8, 8]}
+  dropout: Dropout {prob: 0.5}
+  fc1: Linear {d_input: 16384, d_output: 512, bias: true, params: 8389120}
+  fc2: Linear {d_input: 512, d_output: 256, bias: true, params: 131328}
+  fc3: Linear {d_input: 256, d_output: 2, bias: true, params: 514}
+  relu: Relu
+  params: 8909378
+}
+2026-01-03T11:52:31.919844Z  INFO burn_train::learner::strategies::single::epoch: Executing training step for epoch 1
+2026-01-03T11:52:31.931461Z  INFO burn_train::learner::strategies::single::epoch: Iteration 1

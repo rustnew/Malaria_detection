@@ -1,13 +1,12 @@
-// model.rs - CORRIGÉ
-
 use burn::{
     nn::{
         conv::{Conv2d, Conv2dConfig},
         pool::{AdaptiveAvgPool2d, AdaptiveAvgPool2dConfig},
         Dropout, DropoutConfig, Linear, LinearConfig, Relu,
     },
-    prelude::*,
-    tensor::backend::AutodiffBackend,
+    tensor::backend::Backend,
+    module::Module,
+    config::Config,
 };
 
 #[derive(Config, Debug)]
@@ -41,12 +40,22 @@ impl MalariaModelConfig {
         }
     }
 
-    pub fn init_with<B: AutodiffBackend>(&self, device: &B::Device) -> MalariaModel<B> {
+    pub fn init_with<B: burn::tensor::backend::AutodiffBackend>(&self, device: &B::Device) -> MalariaModel<B> {
         self.init(device)
     }
 }
 
-// CORRECTION: Retirer Clone du derive
+// Méthode de création
+impl MalariaModelConfig {
+    pub fn create(num_classes: usize) -> Self {
+        Self {
+            dropout: 0.5,
+            num_classes,
+        }
+    }
+}
+
+// Modèle
 #[derive(Module, Debug)]
 pub struct MalariaModel<B: Backend> {
     conv1: Conv2d<B>,
@@ -62,8 +71,7 @@ pub struct MalariaModel<B: Backend> {
 }
 
 impl<B: Backend> MalariaModel<B> {
-    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 2> {
-        // Convolutional layers with ReLU activations
+    pub fn forward(&self, x: burn::tensor::Tensor<B, 4>) -> burn::tensor::Tensor<B, 2> {
         let x = self.conv1.forward(x);
         let x = self.relu.forward(x);
         
@@ -76,14 +84,11 @@ impl<B: Backend> MalariaModel<B> {
         let x = self.conv4.forward(x);
         let x = self.relu.forward(x);
         
-        // Adaptive pooling
         let x = self.pool.forward(x);
         
-        // Flatten manually
         let [batch_size, channels, height, width] = x.dims();
         let x = x.reshape([batch_size, channels * height * width]);
         
-        // Fully connected layers with dropout
         let x = self.fc1.forward(x);
         let x = self.relu.forward(x);
         let x = self.dropout.forward(x);
@@ -92,35 +97,6 @@ impl<B: Backend> MalariaModel<B> {
         let x = self.relu.forward(x);
         let x = self.dropout.forward(x);
         
-        // Output layer
         self.fc3.forward(x)
-    }
-
-    pub fn forward_classification(&self, x: Tensor<B, 4>) -> Tensor<B, 2> {
-        let output = self.forward(x);
-        output
-    }
-}
-
-#[derive(Config, Debug)]
-pub struct TrainingConfig {
-    pub learning_rate: f64,
-    pub num_epochs: usize,
-    pub batch_size: usize,
-    pub num_workers: usize,
-    pub shuffle: bool,
-    pub device: String,
-}
-
-impl Default for TrainingConfig {
-    fn default() -> Self {
-        Self {
-            learning_rate: 1e-3,
-            num_epochs: 10,
-            batch_size: 32,
-            num_workers: 4,
-            shuffle: true,
-            device: "cpu".to_string(),
-        }
     }
 }
