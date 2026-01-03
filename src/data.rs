@@ -1,14 +1,50 @@
 use burn::{
-    data::dataloader::batcher::Batcher,
+    prelude::*,
     tensor::{backend::Backend, Int, Tensor, TensorData, Shape},
 };
-use image::{DynamicImage, ImageReader};
+use image::{DynamicImage, imageops::FilterType};
 use rand::seq::SliceRandom;
+use rand::rng;
 use serde::{Deserialize, Serialize};
 use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
+    path::PathBuf,
+    sync::{Arc, RwLock},
 };
+
+// Structure pour images PRÉTRAITÉES avec dimensions
+#[derive(Debug, Clone)]
+pub struct PreprocessedImage {
+    pub data: Vec<f32>,
+    pub label: MalariaLabel,
+    pub height: usize,
+    pub width: usize,
+}
+
+impl PreprocessedImage {
+    pub fn new(img: &DynamicImage, label: MalariaLabel, size: (usize, usize)) -> Self {
+        let (width, height) = (size.0 as u32, size.1 as u32);
+        let img = img.resize_exact(width, height, FilterType::Lanczos3);
+        let rgb_img = img.to_rgb8();
+        
+        let mut data = Vec::with_capacity(3 * height as usize * width as usize);
+        
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = rgb_img.get_pixel(x, y);
+                data.push(pixel[0] as f32 / 255.0);
+                data.push(pixel[1] as f32 / 255.0);
+                data.push(pixel[2] as f32 / 255.0);
+            }
+        }
+        
+        Self { 
+            data, 
+            label,
+            height: height as usize,
+            width: width as usize,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MalariaLabel {
@@ -23,82 +59,195 @@ impl MalariaLabel {
             MalariaLabel::Uninfected => 1,
         }
     }
+}
 
-    pub fn from_index(index: usize) -> Self {
-        match index {
-            0 => MalariaLabel::Parasitized,
-            1 => MalariaLabel::Uninfected,
-            _ => panic!("Invalid index for MalariaLabel"),
+// Dataset
+pub struct MalariaDataset {
+    pub items: Vec<(PathBuf, MalariaLabel)>,
+    pub preprocessed_cache: Option<Vec<PreprocessedImage>>,
+    pub image_size: (usize, usize),
+}
+
+impl MalariaDataset {
+    // Ajouter une méthode len()
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+    
+    // Ajouter une méthode is_empty()
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+    
+    // Méthode new() manquante
+    pub fn new(data_path: &std::path::Path, image_size: (usize, usize)) -> anyhow::Result<Self> {
+        // Implémentation de base - chargez vos images ici
+        let mut items = Vec::new();
+        
+        // Parcourez les dossiers et ajoutez les images
+        let parasitized_path = data_path.join("Parasitized");
+        let uninfected_path = data_path.join("Uninfected");
+        
+        if parasitized_path.exists() && parasitized_path.is_dir() {
+            for entry in std::fs::read_dir(parasitized_path)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "png") {
+                    items.push((path, MalariaLabel::Parasitized));
+                }
+            }
+        }
+        
+        if uninfected_path.exists() && uninfected_path.is_dir() {
+            for entry in std::fs::read_dir(uninfected_path)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "png") {
+                    items.push((path, MalariaLabel::Uninfected));
+                }
+            }
+        }
+        
+        Ok(Self {
+            items,
+            preprocessed_cache: None,
+            image_size,
+        })
+    }
+    
+    // Méthode preprocess_all() 
+    pub fn preprocess_all(&mut self) -> anyhow::Result<()> {
+        println!("Prétraitement de {} images...", self.items.len());
+        let mut cache = Vec::with_capacity(self.items.len());
+        
+        for (path, label) in &self.items {
+            match image::open(path) {
+                Ok(img) => {
+                    let preprocessed = PreprocessedImage::new(&img, label.clone(), self.image_size);
+                    cache.push(preprocessed);
+                }
+                Err(e) => {
+                    eprintln!("Erreur lors du chargement de {:?}: {}", path, e);
+                }
+            }
+        }
+        
+        self.preprocessed_cache = Some(cache);
+        println!("✅ Prétraitement terminé");
+        Ok(())
+    }
+    
+    // Méthode get_batch_preprocessed() pour accès publique
+    pub fn get_batch_preprocessed(&self, indices: &[usize]) -> Vec<PreprocessedImage> {
+        if let Some(cache) = &self.preprocessed_cache {
+            indices.iter()
+                .filter_map(|&idx| cache.get(idx))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
         }
     }
-
-    pub fn to_tensor<B: Backend>(&self, device: &B::Device) -> Tensor<B, 1, Int> {
-        let data: Vec<i64> = vec![self.to_index() as i64];
-        Tensor::from_data(TensorData::new(data, Shape::new([1])), device)
+    
+    // Méthode split()
+    pub fn split(self, train_ratio: f64, val_ratio: f64) -> (Self, Self, Self) {
+        let total = self.items.len();
+        let train_end = (total as f64 * train_ratio) as usize;
+        let val_end = train_end + (total as f64 * val_ratio) as usize;
+        
+        let mut items = self.items;
+        let mut rng = rng();
+        items.shuffle(&mut rng);
+        
+        let train_items = items[0..train_end].to_vec();
+        let val_items = items[train_end..val_end].to_vec();
+        let test_items = items[val_end..].to_vec();
+        
+        (
+            MalariaDataset {
+                items: train_items,
+                preprocessed_cache: None,
+                image_size: self.image_size,
+            },
+            MalariaDataset {
+                items: val_items,
+                preprocessed_cache: None,
+                image_size: self.image_size,
+            },
+            MalariaDataset {
+                items: test_items,
+                preprocessed_cache: None,
+                image_size: self.image_size,
+            },
+        )
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct MalariaItem {
-    pub image: DynamicImage,
-    pub label: MalariaLabel,
-}
-
-impl MalariaItem {
-    pub fn new(image_path: PathBuf, label: MalariaLabel) -> anyhow::Result<Self> {
-        let image = ImageReader::open(image_path)?.decode()?;
-        Ok(Self { image, label })
-    }
-}
-
+// Batcher OPTIMISÉ avec buffer réutilisable
 pub struct MalariaBatcher<B: Backend> {
     device: B::Device,
+    image_buffer: RwLock<Vec<f32>>,
+    label_buffer: RwLock<Vec<i64>>,
 }
 
 impl<B: Backend> MalariaBatcher<B> {
     pub fn new(device: B::Device) -> Self {
-        Self { device }
+        Self { 
+            device,
+            image_buffer: RwLock::new(Vec::new()),
+            label_buffer: RwLock::new(Vec::new()),
+        }
     }
-}
-
-impl<B: Backend> Batcher<B, MalariaItem, MalariaBatch<B>> for MalariaBatcher<B> {
-    fn batch(&self, items: Vec<MalariaItem>, device: &B::Device) -> MalariaBatch<B> {
+    
+    // ⚡ BATcher ULTRA-RAPIDE
+    pub fn batch_preprocessed(&self, items: &[PreprocessedImage]) -> MalariaBatch<B> {
         let batch_size = items.len();
-        let height = 128;
-        let width = 128;
         
-        let mut images = Vec::with_capacity(batch_size * 3 * height * width);
-        let mut labels = Vec::with_capacity(batch_size);
-        
-        for item in items {
-            // Redimensionner l'image
-            let img = item.image.resize_exact(
-                width as u32,
-                height as u32,
-                image::imageops::FilterType::Lanczos3,
-            );
-            
-            // Convertir en RGB et normaliser
-            let rgb_img = img.to_rgb8();
-            
-            for c in 0..3 {
-                for y in 0..height {
-                    for x in 0..width {
-                        let pixel = rgb_img.get_pixel(x as u32, y as u32);
-                        let value = pixel[c] as f32 / 255.0;
-                        images.push(value);
-                    }
-                }
-            }
-            
-            labels.push(item.label.to_index() as i64);
+        if batch_size == 0 {
+            return MalariaBatch {
+                images: Tensor::zeros([0, 3, 128, 128], &self.device),
+                targets: Tensor::zeros([0], &self.device),
+            };
         }
         
-        let images_data = TensorData::new(images, Shape::new([batch_size, 3, height, width]));
-        let images_tensor = Tensor::from_data(images_data, device);
+        // ✅ DIMENSIONS DIRECTES (pas de calcul)
+        let height = items[0].height;
+        let width = items[0].width;
         
-        let targets_data = TensorData::new(labels, Shape::new([batch_size]));
-        let targets_tensor: Tensor<B, 1, Int> = Tensor::from_data(targets_data, device);
+        // ✅ RÉUTILISATION DES BUFFERS
+        let mut image_buffer = self.image_buffer.write().unwrap();
+        let mut label_buffer = self.label_buffer.write().unwrap();
+        
+        // Redimensionnement intelligent
+        let needed_capacity = batch_size * 3 * height * width;
+        if image_buffer.capacity() < needed_capacity {
+            image_buffer.reserve(needed_capacity);
+        }
+        
+        if label_buffer.capacity() < batch_size {
+            label_buffer.reserve(batch_size);
+        }
+        
+        // Vidage rapide
+        image_buffer.clear();
+        label_buffer.clear();
+        
+        // Remplissage
+        for item in items {
+            image_buffer.extend_from_slice(&item.data);
+            label_buffer.push(item.label.to_index() as i64);
+        }
+        
+        // Création des tenseurs
+        let images_tensor = Tensor::from_data(
+            TensorData::new(image_buffer.clone(), Shape::new([batch_size, 3, height, width])),
+            &self.device,
+        );
+        
+        let targets_tensor: Tensor<B, 1, Int> = Tensor::from_data(
+            TensorData::new(label_buffer.clone(), Shape::new([batch_size])),
+            &self.device,
+        );
         
         MalariaBatch { 
             images: images_tensor, 
@@ -113,140 +262,68 @@ pub struct MalariaBatch<B: Backend> {
     pub targets: Tensor<B, 1, Int>,
 }
 
-pub struct MalariaDataset {
-    pub items: Vec<(PathBuf, MalariaLabel)>,
-}
-
-impl MalariaDataset {
-    pub fn new(data_dir: &Path) -> anyhow::Result<Self> {
-        let mut items = Vec::new();
-        
-        // Charger les images parasitées
-        let parasitized_dir = data_dir.join("Parasitized");
-        if parasitized_dir.exists() {
-            for entry in std::fs::read_dir(parasitized_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().map_or(false, |ext| {
-                    ext == "png" || ext == "jpg" || ext == "jpeg"
-                }) {
-                    items.push((path, MalariaLabel::Parasitized));
-                }
-            }
-        }
-        
-        // Charger les images non infectées
-        let uninfected_dir = data_dir.join("Uninfected");
-        if uninfected_dir.exists() {
-            for entry in std::fs::read_dir(uninfected_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().map_or(false, |ext| {
-                    ext == "png" || ext == "jpg" || ext == "jpeg"
-                }) {
-                    items.push((path, MalariaLabel::Uninfected));
-                }
-            }
-        }
-        
-        Ok(Self { items })
-    }
-    
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-    
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-    
-    pub fn split(&self, train_ratio: f64, val_ratio: f64) -> (Self, Self, Self) {
-        let mut rng = rand::rng();
-        let mut shuffled: Vec<_> = self.items.clone();
-        shuffled.shuffle(&mut rng);
-        
-        let total = shuffled.len();
-        let train_end = (total as f64 * train_ratio) as usize;
-        let val_end = train_end + (total as f64 * val_ratio) as usize;
-        
-        let train_items = shuffled[..train_end].to_vec();
-        let val_items = shuffled[train_end..val_end].to_vec();
-        let test_items = shuffled[val_end..].to_vec();
-        
-        (
-            Self { items: train_items },
-            Self { items: val_items },
-            Self { items: test_items },
-        )
-    }
-    
-    pub fn get_batch(&self, indices: &[usize]) -> Vec<MalariaItem> {
-        indices
-            .iter()
-            .filter_map(|&idx| {
-                let (path, label) = &self.items[idx];
-                MalariaItem::new(path.clone(), label.clone()).ok()
-            })
-            .collect()
-    }
-}
-
+// DataLoader OPTIMISÉ
 pub struct MalariaDataLoader {
-    pub dataset: Arc<MalariaDataset>,
+    dataset: Arc<MalariaDataset>,
+    indices: Vec<usize>,
     batch_size: usize,
-    shuffle: bool,
 }
 
 impl MalariaDataLoader {
     pub fn new(dataset: MalariaDataset, batch_size: usize, shuffle: bool) -> Self {
+        let mut indices: Vec<usize> = (0..dataset.len()).collect();
+        
+        // Shuffle une seule fois
+        if shuffle {
+            let mut rng = rng();
+            indices.shuffle(&mut rng);
+        }
+        
         Self {
             dataset: Arc::new(dataset),
+            indices,
             batch_size,
-            shuffle,
         }
     }
     
     pub fn iter(&self) -> MalariaDataLoaderIter {
-        let indices: Vec<usize> = (0..self.dataset.len()).collect();
         MalariaDataLoaderIter {
             dataset: Arc::clone(&self.dataset),
-            indices,
+            indices: &self.indices,
             batch_size: self.batch_size,
             current: 0,
-            shuffle: self.shuffle,
         }
     }
     
     pub fn len(&self) -> usize {
         self.dataset.len()
     }
+    
+    // Méthode publique pour accéder aux données prétraitées
+    pub fn get_batch_preprocessed(&self, indices: &[usize]) -> Vec<PreprocessedImage> {
+        self.dataset.get_batch_preprocessed(indices)
+    }
 }
 
-pub struct MalariaDataLoaderIter {
+pub struct MalariaDataLoaderIter<'a> {
     dataset: Arc<MalariaDataset>,
-    indices: Vec<usize>,
+    indices: &'a [usize],
     batch_size: usize,
     current: usize,
-    shuffle: bool,
 }
 
-impl Iterator for MalariaDataLoaderIter {
-    type Item = Vec<usize>;
+impl<'a> Iterator for MalariaDataLoaderIter<'a> {
+    type Item = &'a [usize];
     
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current >= self.dataset.len() {
+        if self.current >= self.indices.len() {
             return None;
         }
         
-        if self.shuffle && self.current == 0 {
-            let mut rng = rand::rng();
-            self.indices.shuffle(&mut rng);
-        }
-        
-        let end = std::cmp::min(self.current + self.batch_size, self.dataset.len());
-        let batch_indices = self.indices[self.current..end].to_vec();
+        let end = std::cmp::min(self.current + self.batch_size, self.indices.len());
+        let batch_slice = &self.indices[self.current..end];
         self.current = end;
         
-        Some(batch_indices)
+        Some(batch_slice)
     }
 }

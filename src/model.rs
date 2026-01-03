@@ -1,3 +1,5 @@
+// model.rs - CORRIGÉ
+
 use burn::{
     nn::{
         conv::{Conv2d, Conv2dConfig},
@@ -44,6 +46,7 @@ impl MalariaModelConfig {
     }
 }
 
+// CORRECTION: Retirer Clone du derive
 #[derive(Module, Debug)]
 pub struct MalariaModel<B: Backend> {
     conv1: Conv2d<B>,

@@ -1,21 +1,23 @@
 use burn::{
-    data::dataloader::batcher::Batcher,
+    optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
     tensor::backend::AutodiffBackend,
+    nn::loss::CrossEntropyLoss,
 };
 
 use crate::{
-    data::{MalariaBatcher, MalariaDataLoader, MalariaDataset},
+    data::{MalariaBatcher, MalariaDataLoader},
     metrics::{ClassificationMetrics, MetricsTracker, TrainingMetrics},
     model::{MalariaModel, MalariaModelConfig, TrainingConfig},
 };
 
 pub struct MalariaTrainer<B: AutodiffBackend> {
     pub model: MalariaModel<B>,
+    pub optimizer_config: AdamConfig,
     pub batcher: MalariaBatcher<B>,
+    pub loss_fn: CrossEntropyLoss<B>,
     pub device: B::Device,
     pub config: TrainingConfig,
-    pub learning_rate: f64,
 }
 
 impl<B: AutodiffBackend> MalariaTrainer<B> {
@@ -27,15 +29,23 @@ impl<B: AutodiffBackend> MalariaTrainer<B> {
         let model = model_config.init_with(&device);
         let batcher = MalariaBatcher::new(device.clone());
         
+        // Configuration de l'optimizer
+        let optimizer_config = AdamConfig::new()
+            .with_epsilon(1e-8);
+        
+        let loss_fn = CrossEntropyLoss::new(None, &device);
+        
         Self {
             model,
+            optimizer_config,
             batcher,
+            loss_fn,
             device,
-            config: train_config.clone(),
-            learning_rate: train_config.learning_rate,
+            config: train_config,
         }
     }
     
+    // ENTRAÎNEMENT OPTIMISÉ
     pub fn train_epoch(
         &mut self,
         train_loader: &MalariaDataLoader,
@@ -43,68 +53,74 @@ impl<B: AutodiffBackend> MalariaTrainer<B> {
         let mut total_loss = 0.0;
         let mut total_correct = 0;
         let mut total_samples = 0;
+        let mut batch_count = 0;
         
-        let batches: Vec<_> = train_loader.iter().collect();
+        // Création de l'optimizer avec état
+        let mut optimizer = self.optimizer_config.init();
         
-        for batch_indices in batches.iter() {
-            let items = train_loader.dataset.get_batch(batch_indices);
-            let batch = self.batcher.batch(items, &self.device);
+        // ITÉRATION DIRECTE sans collecter tous les batches
+        for batch_indices in train_loader.iter() {
+            // Utilisation du cache prétraité via méthode publique
+            let items = train_loader.get_batch_preprocessed(batch_indices);
+            let batch = self.batcher.batch_preprocessed(&items);
             
-            let output = self.model.forward(batch.images);
-            let loss = burn::nn::loss::CrossEntropyLoss::new(None, &self.device).forward(
+            let output = self.model.forward(batch.images.clone());
+            
+            // Utilisation de la loss pré-créée
+            let loss = self.loss_fn.forward(
                 output.clone(),
                 batch.targets.clone(),
             );
             
-            // Calculer les gradients
+            // Backward + optimisation
             let grads = loss.backward();
+            let gradients_params = GradientsParams::from_grads(grads, &self.model);
             
-            // Mettre à jour manuellement les paramètres (approche SGD simple)
-            self.update_parameters_simple(&grads);
+            self.model = optimizer.step(self.config.learning_rate, self.model.clone(), gradients_params);
             
             total_loss += loss.clone().into_scalar().elem::<f64>();
             
-            // CORRECTION : Calculer la précision correctement
-            // .argmax(1) retourne un tenseur de dimension [batch_size, 1]
-            // On doit le flatten en [batch_size]
-            let predictions = output.argmax(1);  // [batch_size, 1]
-            let targets = batch.targets.clone(); // [batch_size]
-            
-            // CORRECTION : Reshape predictions pour qu'elles aient la même dimension que targets
+            // Calcul précision optimisé
             let batch_size = batch_indices.len();
+            let predictions = output.argmax(1);
+            let targets = batch.targets;
+            
             let predictions_reshaped = predictions.reshape([batch_size]);
             let targets_reshaped = targets.reshape([batch_size]);
             
-            // Comparer élément par élément
-            let correct = predictions_reshaped
-                .equal(targets_reshaped)
-                .int()
-                .sum()
-                .into_scalar()
-                .elem::<i64>() as usize;
+            // Calcul des prédictions correctes
+            let predictions_data = predictions_reshaped.into_data();
+            let targets_data = targets_reshaped.into_data();
+            
+            let correct = predictions_data
+                .as_slice::<i64>()
+                .unwrap()
+                .iter()
+                .zip(targets_data.as_slice::<i64>().unwrap().iter())
+                .filter(|(&pred, &target)| pred == target)
+                .count();
             
             total_correct += correct;
-            total_samples += batch_indices.len();
+            total_samples += batch_size;
+            batch_count += 1;
         }
         
-        let avg_loss = total_loss / batches.len() as f64;
-        let accuracy = total_correct as f64 / total_samples as f64;
+        let avg_loss = if batch_count > 0 {
+            total_loss / batch_count as f64
+        } else {
+            0.0
+        };
+        
+        let accuracy = if total_samples > 0 {
+            total_correct as f64 / total_samples as f64
+        } else {
+            0.0
+        };
         
         (avg_loss, accuracy)
     }
     
-    fn update_parameters_simple(&mut self, grads: &B::Gradients) {
-        // Approche simplifiée : on va simplement ignorer l'optimisation pour l'instant
-        // et se concentrer sur la compilation
-        // Dans une vraie implémentation, il faudrait utiliser l'API d'optimisation de Burn
-        
-        // Pour l'instant, on ne fait rien avec les gradients
-        // Cela permettra au code de compiler
-        // TODO: Implémenter une vraie mise à jour des paramètres
-        let _ = grads; // Utiliser le paramètre pour éviter l'avertissement
-        println!("Note: Optimisation simplifiée - à implémenter");
-    }
-
+    // VALIDATION OPTIMISÉE (sans autodiff)
     pub fn validate(
         &self,
         val_loader: &MalariaDataLoader,
@@ -112,67 +128,86 @@ impl<B: AutodiffBackend> MalariaTrainer<B> {
         let mut total_loss = 0.0;
         let mut total_correct = 0;
         let mut total_samples = 0;
+        let mut batch_count = 0;
         
         let mut all_predictions = Vec::new();
         let mut all_targets = Vec::new();
         
-        let batches: Vec<_> = val_loader.iter().collect();
+        // Clone du modèle pour la validation
+        let model = &self.model;
         
-        for batch_indices in batches.iter() {
-            let items = val_loader.dataset.get_batch(batch_indices);
-            let batch = self.batcher.batch(items, &self.device);
+        // ITÉRATION DIRECTE
+        for batch_indices in val_loader.iter() {
+            let items = val_loader.get_batch_preprocessed(batch_indices);
+            let batch = self.batcher.batch_preprocessed(&items);
             
-            let output = self.model.forward(batch.images.clone());
-            let loss = burn::nn::loss::CrossEntropyLoss::new(None, &self.device).forward(
+            // Forward pass sans grad (dans Burn, pas besoin de no_grad explicitement pour juste forward)
+            let output = model.forward(batch.images.clone());
+            
+            // Calcul de la loss (mais pas de backward)
+            let loss = self.loss_fn.forward(
                 output.clone(),
                 batch.targets.clone(),
             );
             
             total_loss += loss.clone().into_scalar().elem::<f64>();
             
-            // CORRECTION : Calculer la précision correctement
-            let predictions = output.argmax(1);  // [batch_size, 1]
-            let targets = batch.targets.clone(); // [batch_size]
+            let predictions = output.argmax(1);
+            let targets = batch.targets;
             
-            // CORRECTION : Reshape predictions pour qu'elles aient la même dimension que targets
             let batch_size = batch_indices.len();
             let predictions_reshaped = predictions.reshape([batch_size]);
             let targets_reshaped = targets.clone().reshape([batch_size]);
             
-            let correct = predictions_reshaped.clone()
-                .equal(targets_reshaped)
-                .int()
-                .sum()
-                .into_scalar()
-                .elem::<i64>() as usize;
+            // Calcul des prédictions correctes
+            let predictions_data = predictions_reshaped.into_data();
+            let targets_data = targets_reshaped.into_data();
+            
+            let correct = predictions_data
+                .as_slice::<i64>()
+                .unwrap()
+                .iter()
+                .zip(targets_data.as_slice::<i64>().unwrap().iter())
+                .filter(|(&pred, &target)| pred == target)
+                .count();
             
             total_correct += correct;
-            total_samples += batch_indices.len();
+            total_samples += batch_size;
+            batch_count += 1;
             
-            // Collecter les prédictions et cibles
-            // Pour collecter les données, on utilise le tenseur reshaped
-            let pred_indices: Vec<usize> = predictions_reshaped
-                .into_data()
-                .as_slice::<i64>()
-                .unwrap()
-                .iter()
-                .map(|&x| x as usize)
-                .collect();
-            
-            let target_indices: Vec<usize> = targets
-                .into_data()
-                .as_slice::<i64>()
-                .unwrap()
-                .iter()
-                .map(|&x| x as usize)
-                .collect();
-            
-            all_predictions.extend(pred_indices);
-            all_targets.extend(target_indices);
+            // Collecter prédictions (uniquement à la fin ou moins fréquemment)
+            if all_predictions.len() < 10000 {
+                let pred_indices: Vec<usize> = predictions_data
+                    .as_slice::<i64>()
+                    .unwrap()
+                    .iter()
+                    .map(|&x| x as usize)
+                    .collect();
+                
+                let target_indices: Vec<usize> = targets
+                    .into_data()
+                    .as_slice::<i64>()
+                    .unwrap()
+                    .iter()
+                    .map(|&x| x as usize)
+                    .collect();
+                
+                all_predictions.extend(pred_indices);
+                all_targets.extend(target_indices);
+            }
         }
         
-        let avg_loss = total_loss / batches.len() as f64;
-        let accuracy = total_correct as f64 / total_samples as f64;
+        let avg_loss = if batch_count > 0 {
+            total_loss / batch_count as f64
+        } else {
+            0.0
+        };
+        
+        let accuracy = if total_samples > 0 {
+            total_correct as f64 / total_samples as f64
+        } else {
+            0.0
+        };
         
         let mut metrics = ClassificationMetrics::new();
         metrics.calculate(&all_predictions, &all_targets);
@@ -180,11 +215,18 @@ impl<B: AutodiffBackend> MalariaTrainer<B> {
         (avg_loss, accuracy, metrics)
     }
     
+    // MÉTHODE PRINCIPALE OPTIMISÉE
     pub fn train(
         &mut self,
-        train_dataset: MalariaDataset,
-        val_dataset: MalariaDataset,
+        mut train_dataset: crate::data::MalariaDataset,
+        mut val_dataset: crate::data::MalariaDataset,
     ) -> anyhow::Result<MetricsTracker> {
+        // PRÉTRAITEMENT
+        println!("\n⚡ PRÉTRAITEMENT DES DONNÉES...");
+        train_dataset.preprocess_all()?;
+        val_dataset.preprocess_all()?;
+        
+        // DATALOADERS
         let train_loader = MalariaDataLoader::new(
             train_dataset,
             self.config.batch_size,
@@ -194,40 +236,39 @@ impl<B: AutodiffBackend> MalariaTrainer<B> {
         let val_loader = MalariaDataLoader::new(
             val_dataset,
             self.config.batch_size,
-            false, // Ne pas mélanger la validation
+            false,
         );
         
         let mut tracker = MetricsTracker::new(self.config.num_epochs);
         
-        println!("Starting training for {} epochs...", self.config.num_epochs);
-        println!("Train samples: {}", train_loader.len());
-        println!("Validation samples: {}", val_loader.len());
-        println!("Batch size: {}", self.config.batch_size);
-        println!("Learning rate: {}", self.config.learning_rate);
-        println!("Device: {:?}", self.device);
+        println!("🚀 DÉMARRAGE DE L'ENTRAÎNEMENT...");
+        println!("📊 Configuration: {} epochs, LR: {}, Batch: {}", 
+                 self.config.num_epochs, 
+                 self.config.learning_rate,
+                 self.config.batch_size);
+        
+        let start_time = std::time::Instant::now();
         
         for epoch in 0..self.config.num_epochs {
-            println!("\nEpoch {}/{}", epoch + 1, self.config.num_epochs);
-            println!("{}", "=".repeat(50));
+            let epoch_start = std::time::Instant::now();
             
-            // Phase d'entraînement
-            println!("Training...");
+            println!("\n--- ÉPOQUE {}/{} ---", epoch + 1, self.config.num_epochs);
+            
             let (train_loss, train_acc) = self.train_epoch(&train_loader);
-            
-            // Phase de validation
-            println!("Validating...");
             let (val_loss, val_acc, val_metrics) = self.validate(&val_loader);
             
-            // Afficher les résultats
-            println!("\nEpoch {} Results:", epoch + 1);
-            println!("  Train Loss: {:.4}, Train Acc: {:.2}%", 
-                train_loss, train_acc * 100.0);
-            println!("  Val Loss:   {:.4}, Val Acc:   {:.2}%", 
-                val_loss, val_acc * 100.0);
+            let epoch_duration = epoch_start.elapsed();
             
-            val_metrics.print_summary();
+            println!("   Perte: {:.4} → {:.4}", train_loss, val_loss);
+            println!("   Précision: {:.1}% → {:.1}%", train_acc * 100.0, val_acc * 100.0);
+            println!("   Temps epoch: {:.2?}", epoch_duration);
             
-            // Suivre les métriques
+            // Affichage métriques détaillées occasionnellement
+            if (epoch + 1) % 5 == 0 {
+                println!("   Métriques validation:");
+                val_metrics.print_summary();
+            }
+            
             tracker.add(TrainingMetrics {
                 epoch: epoch + 1,
                 train_loss,
@@ -237,47 +278,42 @@ impl<B: AutodiffBackend> MalariaTrainer<B> {
                 learning_rate: self.config.learning_rate,
             });
             
-            // Sauvegarde simplifiée du modèle
-            if (epoch + 1) % 5 == 0 {
-                self.save_model_simple(epoch + 1)?;
+            // Sauvegarde conditionnelle
+            if (epoch + 1) % 2 == 0 || epoch == self.config.num_epochs - 1 {
+                self.save_checkpoint(epoch + 1)?;
             }
         }
         
-        println!("\nTraining completed!");
-        tracker.print_history();
+        let total_duration = start_time.elapsed();
+        println!("\n✅ ENTRAÎNEMENT TERMINÉ en {:.2?}", total_duration);
         
         Ok(tracker)
     }
     
-    // Sauvegarde simplifiée du modèle
-    pub fn save_model_simple(&self, epoch: usize) -> anyhow::Result<()> {
+    // SAUVEGARDE
+    pub fn save_checkpoint(&self, epoch: usize) -> anyhow::Result<()> {
         let checkpoint_dir = "checkpoints";
         std::fs::create_dir_all(checkpoint_dir)?;
         
-        let model_path = format!("{}/model_epoch_{}.json", checkpoint_dir, epoch);
+        let model_path = format!("{}/epoch_{}.json", checkpoint_dir, epoch);
         
-        // Sauvegarder une description du modèle
-        let model_info = format!(
-            "Model checkpoint at epoch {}\nLearning rate: {}\nConfig: {:?}",
-            epoch, self.learning_rate, self.config
-        );
-        
-        std::fs::write(&model_path, model_info)?;
-        
-        println!("Model info saved for epoch {}: {}", epoch, model_path);
-        
-        Ok(())
-    }
-    
-    // Chargement simplifié du modèle
-    pub fn load_model_simple(&mut self, epoch: usize) -> anyhow::Result<()> {
-        let model_path = format!("checkpoints/model_epoch_{}.json", epoch);
-        
-        if !std::path::Path::new(&model_path).exists() {
-            return Err(anyhow::anyhow!("Checkpoint not found: {}", model_path));
+        #[derive(serde::Serialize)]
+        struct CheckpointInfo {
+            epoch: usize,
+            learning_rate: f64,
+            timestamp: String,
         }
         
-        println!("Model info loaded from epoch {}", epoch);
+        let info = CheckpointInfo {
+            epoch,
+            learning_rate: self.config.learning_rate,
+            timestamp: chrono::Local::now().to_rfc3339(),
+        };
+        
+        let json = serde_json::to_string_pretty(&info)?;
+        std::fs::write(&model_path, json)?;
+        
+        println!("   ✅ Checkpoint sauvegardé: {}", model_path);
         
         Ok(())
     }
